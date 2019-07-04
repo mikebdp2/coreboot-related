@@ -1,0 +1,326 @@
+diff --git a/cli_classic.c b/cli_classic.c
+index b79f953..2847805 100644
+--- a/cli_classic.c
++++ b/cli_classic.c
+@@ -48,6 +48,7 @@ static void cli_classic_usage(const char *name)
+ 	       " -V | --verbose                     more verbose output\n"
+ 	       " -c | --chip <chipname>             probe only for specified flash chip\n"
+ 	       " -f | --force                       force specific operations (see man page)\n"
++	       "      --dangerous-bruteforce        verify each small chunk and probe constantly\n"
+ 	       " -n | --noverify                    don't auto-verify\n"
+ 	       " -N | --noverify-all                verify included regions only (cf. -i)\n"
+ 	       " -l | --layout <layoutfile>         read ROM layout from <layoutfile>\n"
+@@ -101,7 +102,7 @@ int main(int argc, char *argv[])
+ #if CONFIG_PRINT_WIKI == 1
+ 	int list_supported_wiki = 0;
+ #endif
+-	int read_it = 0, write_it = 0, erase_it = 0, verify_it = 0;
++	int read_it = 0, write_it = 0, erase_it = 0, verify_it = 0, bruteforce = 0, timeout = 30000;
+ 	int dont_verify_it = 0, dont_verify_all = 0, list_supported = 0, operation_specified = 0;
+ 	struct flashrom_layout *layout = NULL;
+ 	enum programmer prog = PROGRAMMER_INVALID;
+@@ -110,6 +111,7 @@ int main(int argc, char *argv[])
+ 		OPTION_FMAP,
+ 		OPTION_FMAP_FILE,
+ 		OPTION_FLASH_CONTENTS,
++		OPTION_BRUTEFORCE,
+ 	};
+ 	int ret = 0;
+ 
+@@ -124,6 +126,7 @@ int main(int argc, char *argv[])
+ 		{"chip",		1, NULL, 'c'},
+ 		{"verbose",		0, NULL, 'V'},
+ 		{"force",		0, NULL, 'f'},
++		{"dangerous-bruteforce", 0, NULL, OPTION_BRUTEFORCE},
+ 		{"layout",		1, NULL, 'l'},
+ 		{"ifd",			0, NULL, OPTION_IFD},
+ 		{"fmap",		0, NULL, OPTION_FMAP},
+@@ -226,6 +229,9 @@ int main(int argc, char *argv[])
+ 		case 'f':
+ 			force = 1;
+ 			break;
++		case OPTION_BRUTEFORCE:
++			bruteforce = 1;
++			break;
+ 		case 'l':
+ 			if (layoutfile) {
+ 				fprintf(stderr, "Error: --layout specified "
+@@ -500,16 +506,27 @@ int main(int argc, char *argv[])
+ 	msg_pdbg("The following protocols are supported: %s.\n", tempstr);
+ 	free(tempstr);
+ 
+-	for (j = 0; j < registered_master_count; j++) {
+-		startchip = 0;
+-		while (chipcount < ARRAY_SIZE(flashes)) {
+-			startchip = probe_flash(&registered_masters[j], startchip, &flashes[chipcount], 0);
+-			if (startchip == -1)
+-				break;
+-			chipcount++;
+-			startchip++;
++	do {
++		chipcount = 0;
++		for (j = 0; j < registered_master_count; j++) {
++			startchip = 0;
++			while (chipcount < ARRAY_SIZE(flashes)) {
++				startchip = probe_flash(&registered_masters[j], startchip, &flashes[chipcount], 0);
++				if (startchip == -1)
++					break;
++				chipcount++;
++				startchip++;
++			}
+ 		}
+-	}
++		timeout--;
++		if (!timeout) {
++			msg_cerr("Error: Timed out trying to detect a chip.\n");
++			ret = 1;
++			goto out_shutdown;
++		}
++	} while (bruteforce && ( !chipcount || // wait for the correct chip detection
++			((flashes[0].chip->manufacture_id == GENERIC_MANUF_ID) ||
++			 (flashes[0].chip->model_id == GENERIC_DEVICE_ID)) ) );
+ 
+ 	if (chipcount > 1) {
+ 		msg_cinfo("Multiple flash chip definitions match the detected chip(s): \"%s\"",
+@@ -647,6 +664,7 @@ int main(int argc, char *argv[])
+ #if CONFIG_INTERNAL == 1
+ 	flashrom_flag_set(fill_flash, FLASHROM_FLAG_FORCE_BOARDMISMATCH, !!force_boardmismatch);
+ #endif
++	flashrom_flag_set(fill_flash, FLASHROM_FLAG_BRUTEFORCE, !!bruteforce);
+ 	flashrom_flag_set(fill_flash, FLASHROM_FLAG_VERIFY_AFTER_WRITE, !dont_verify_it);
+ 	flashrom_flag_set(fill_flash, FLASHROM_FLAG_VERIFY_WHOLE_CHIP, !dont_verify_all);
+ 
+diff --git a/flash.h b/flash.h
+index b60a980..be3e60e 100644
+--- a/flash.h
++++ b/flash.h
+@@ -262,6 +262,7 @@ struct flashrom_flashctx {
+ 	struct {
+ 		bool force;
+ 		bool force_boardmismatch;
++		bool bruteforce;
+ 		bool verify_after_write;
+ 		bool verify_whole_chip;
+ 	} flags;
+diff --git a/flashrom.c b/flashrom.c
+index cb1dca6..276b113 100644
+--- a/flashrom.c
++++ b/flashrom.c
+@@ -1505,6 +1505,8 @@ static int walk_eraseblocks(struct flashctx *const flashctx,
+ 	size_t i, j;
+ 	bool first = true;
+ 	struct block_eraser *const eraser = &flashctx->chip->block_erasers[erasefunction];
++	unsigned int bruteforce = flashrom_flag_get(flashctx, FLASHROM_FLAG_BRUTEFORCE);
++	int timeout;
+ 
+ 	info->erase_start = 0;
+ 	for (i = 0; i < NUM_ERASEREGIONS; ++i) {
+@@ -1526,9 +1528,34 @@ static int walk_eraseblocks(struct flashctx *const flashctx,
+ 				msg_cdbg(", ");
+ 			msg_cdbg("0x%06x-0x%06x:", info->erase_start, info->erase_end);
+ 
+-			ret = per_blockfn(flashctx, info, eraser->block_erase);
+-			if (ret)
+-				return ret;
++			if (!bruteforce) {
++				ret = per_blockfn(flashctx, info, eraser->block_erase);
++				if (ret)
++					return ret;
++			} else {
++				timeout = 30000;
++				while(1) {
++					timeout--;
++					if (!timeout) {
++						msg_cerr("%s timeout during command execution\n", __func__);
++						return 2;
++					}
++
++					/* First probe. */
++					if (flashctx->chip->probe(flashctx) != 1)
++						continue;
++
++					ret = per_blockfn(flashctx, info, eraser->block_erase);
++					if (ret)
++						continue;
++
++					/* Second probe. */
++					if (flashctx->chip->probe(flashctx) != 1)
++						continue;
++
++					break;
++				}
++			}
+ 		}
+ 		if (info->region_end < info->erase_start)
+ 			break;
+diff --git a/libflashrom.c b/libflashrom.c
+index af62002..245275c 100644
+--- a/libflashrom.c
++++ b/libflashrom.c
+@@ -251,6 +251,7 @@ void flashrom_flag_set(struct flashrom_flashctx *const flashctx,
+ 	switch (flag) {
+ 		case FLASHROM_FLAG_FORCE:		flashctx->flags.force = value; break;
+ 		case FLASHROM_FLAG_FORCE_BOARDMISMATCH:	flashctx->flags.force_boardmismatch = value; break;
++		case FLASHROM_FLAG_BRUTEFORCE:		flashctx->flags.bruteforce = value; break;
+ 		case FLASHROM_FLAG_VERIFY_AFTER_WRITE:	flashctx->flags.verify_after_write = value; break;
+ 		case FLASHROM_FLAG_VERIFY_WHOLE_CHIP:	flashctx->flags.verify_whole_chip = value; break;
+ 	}
+@@ -268,6 +269,7 @@ bool flashrom_flag_get(const struct flashrom_flashctx *const flashctx, const enu
+ 	switch (flag) {
+ 		case FLASHROM_FLAG_FORCE:		return flashctx->flags.force;
+ 		case FLASHROM_FLAG_FORCE_BOARDMISMATCH:	return flashctx->flags.force_boardmismatch;
++		case FLASHROM_FLAG_BRUTEFORCE:		return flashctx->flags.bruteforce;
+ 		case FLASHROM_FLAG_VERIFY_AFTER_WRITE:	return flashctx->flags.verify_after_write;
+ 		case FLASHROM_FLAG_VERIFY_WHOLE_CHIP:	return flashctx->flags.verify_whole_chip;
+ 		default:				return false;
+diff --git a/libflashrom.h b/libflashrom.h
+index 38c95d2..0f2ead8 100644
+--- a/libflashrom.h
++++ b/libflashrom.h
+@@ -51,6 +51,7 @@ void flashrom_flash_release(struct flashrom_flashctx *);
+ enum flashrom_flag {
+ 	FLASHROM_FLAG_FORCE,
+ 	FLASHROM_FLAG_FORCE_BOARDMISMATCH,
++	FLASHROM_FLAG_BRUTEFORCE,
+ 	FLASHROM_FLAG_VERIFY_AFTER_WRITE,
+ 	FLASHROM_FLAG_VERIFY_WHOLE_CHIP,
+ };
+diff --git a/spi25.c b/spi25.c
+index 36f265a..26f61df 100644
+--- a/spi25.c
++++ b/spi25.c
+@@ -21,6 +21,7 @@
+ #include <stddef.h>
+ #include <string.h>
+ #include <stdbool.h>
++#include <stdlib.h>
+ #include "flash.h"
+ #include "flashchips.h"
+ #include "chipdrivers.h"
+@@ -640,6 +641,48 @@ int spi_nbyte_read(struct flashctx *flash, unsigned int address, uint8_t *bytes,
+ 	return spi_send_command(flash, 1 + addr_len, len, cmd, bytes);
+ }
+ 
++static int spi_rw_bruteforce(struct flashctx *flash, uint8_t *buf1, uint8_t *buf2,
++			   unsigned int startrw_here, unsigned int torw_len, bool rw_flag) {
++	int rc = 0;
++	int timeout = 30000;
++	while (1) {
++		timeout--;
++		if (!timeout) {
++			msg_cerr("%s timeout during command execution\n", __func__);
++			return -1;
++		}
++
++		/* First probe. */
++		if (flash->chip->probe(flash) != 1)
++			continue;
++
++		/* First operation. */
++		if (rw_flag == 0)
++			rc = spi_nbyte_read(flash, startrw_here, buf1, torw_len);
++		else
++			rc = spi_nbyte_program(flash, startrw_here, buf1, torw_len);
++
++		if (rc != 0)
++			break;
++
++		/* Second probe. */
++		if (flash->chip->probe(flash) != 1)
++			continue;
++
++		/* Second operation. */
++		rc = spi_nbyte_read(flash, startrw_here, buf2, torw_len);
++		if (rc != 0)
++			break;
++
++		/* Compare two buffers. */
++		if (memcmp(buf1, buf2, torw_len))
++			continue;
++
++		break;
++	}
++	return rc;
++}
++
+ /*
+  * Read a part of the flash chip.
+  * Data is read in chunks with a maximum size of chunksize.
+@@ -649,12 +692,34 @@ int spi_read_chunked(struct flashctx *flash, uint8_t *buf, unsigned int start,
+ {
+ 	int ret;
+ 	size_t to_read;
++
++	unsigned int bruteforce = flashrom_flag_get(flash, FLASHROM_FLAG_BRUTEFORCE);
++	uint8_t *const buf1 = bruteforce ? malloc(chunksize) : NULL;
++	uint8_t *const buf2 = bruteforce ? malloc(chunksize) : NULL;
++
++	if (bruteforce) {
++		if (!buf1 || !buf2) {
++			msg_gerr("Out of memory!\n");
++			goto _free_ret;
++		}
++		msg_cdbg("spi_read_chunked: chunksize %i ---> %i\n", chunksize, min(chunksize, 256));
++		chunksize = min(chunksize, 256);
++	}
++
+ 	for (; len; len -= to_read, buf += to_read, start += to_read) {
+ 		to_read = min(chunksize, len);
+-		ret = spi_nbyte_read(flash, start, buf, to_read);
++		if (bruteforce) {
++			ret = spi_rw_bruteforce(flash, buf1, buf2, start, to_read, 0 /* read */);
++			memcpy(buf, buf1, to_read);
++		} else
++			ret = spi_nbyte_read(flash, start, buf, to_read);
+ 		if (ret)
+ 			return ret;
+ 	}
++
++_free_ret:
++	free(buf1);
++	free(buf2);
+ 	return 0;
+ }
+ 
+@@ -674,6 +739,19 @@ int spi_write_chunked(struct flashctx *flash, const uint8_t *buf, unsigned int s
+ 	 */
+ 	unsigned int page_size = flash->chip->page_size;
+ 
++	unsigned int bruteforce = flashrom_flag_get(flash, FLASHROM_FLAG_BRUTEFORCE);
++	uint8_t *const buf1 = bruteforce ? malloc(chunksize) : NULL;
++	uint8_t *const buf2 = bruteforce ? malloc(chunksize) : NULL;
++
++	if (bruteforce) {
++		if (!buf1 || !buf2) {
++			msg_gerr("Out of memory!\n");
++			goto _free_ret;
++		}
++		msg_cdbg("spi_write_chunked: chunksize %i ---> %i\n", chunksize, min(chunksize, 256));
++		chunksize = min(chunksize, 256);
++	}
++
+ 	/* Warning: This loop has a very unusual condition and body.
+ 	 * The loop needs to go through each page with at least one affected
+ 	 * byte. The lowest page number is (start / page_size) since that
+@@ -693,12 +771,20 @@ int spi_write_chunked(struct flashctx *flash, const uint8_t *buf, unsigned int s
+ 			int rc;
+ 
+ 			towrite = min(chunksize, lenhere - j);
+-			rc = spi_nbyte_program(flash, starthere + j, buf + starthere - start + j, towrite);
++			if (bruteforce) {
++				memcpy(buf1, buf + starthere - start + j, towrite);
++				rc = spi_rw_bruteforce(flash, buf1, buf2, starthere + j, towrite, 1 /* write */);
++			} else
++				rc = spi_nbyte_program(flash, starthere + j, buf + starthere - start + j, towrite);
++
+ 			if (rc)
+ 				return rc;
+ 		}
+ 	}
+ 
++_free_ret:
++	free(buf1);
++	free(buf2);
+ 	return 0;
+ }
+ 
